@@ -1,0 +1,99 @@
+name: Sample Audit v3 Verify (dispatch)
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_start:
+        description: "First batch index (ignored when claim mode)"
+        default: "-1"
+      batch_count:
+        description: "How many batches in this run (claim mode when start=-1)"
+        default: "3"
+      verify_all:
+        description: "Also run clipping+dc (1) or pitch only (0)"
+        default: "1"
+
+concurrency:
+  group: verify-v3-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout runner repo
+        uses: actions/checkout@v4
+
+      - name: Checkout web-daw-samples
+        uses: actions/checkout@v4
+        with:
+          repository: zulfikarbarbora-outl/web-daw-samples
+          token: ${{ secrets.GH_TOKEN }}
+          path: web-daw-samples
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install librosa soundfile scipy numpy swift-f0 onnxruntime
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Determine batches
+        id: batches
+        env:
+          WEB_DAW_SAMPLES_PAT: ${{ secrets.GH_TOKEN }}
+        run: |
+          cd web-daw-samples
+          if [ "${{ inputs.batch_start }}" = "-1" ]; then
+            CLAIM=$(python3 scripts/v3-tracker.py claim --max ${{ inputs.batch_count }})
+            echo "list=$(echo $CLAIM | python3 -c 'import json,sys; print(",".join(map(str,json.load(sys.stdin)["claimed"])))')" >> $GITHUB_OUTPUT
+          else
+            python3 scripts/v3-tracker.py init || true
+            LIST=""
+            for i in $(seq ${{ inputs.batch_start }} $((${{ inputs.batch_start }} + ${{ inputs.batch_count }} - 1))); do
+              LIST="$LIST,$i"
+            done
+            echo "list=${LIST#,}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run verification
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          REPO_ROOT: ${{ github.workspace }}/web-daw-samples
+          WEB_DAW_SAMPLES_PAT: ${{ secrets.GH_TOKEN }}
+        run: |
+          cd web-daw-samples
+          for B in $(echo "${{ steps.batches.outputs.list }}" | tr ',' ' '); do
+            echo "=== verify batch $B ==="
+            if python3 scripts/verify-batch-v3.py --batch $B; then
+              STATUS=done
+            else
+              STATUS=failed
+            fi
+            SUM=audit-results-v3/verify-batch-$(printf "%03d" $B)-summary.json
+            python3 scripts/v3-tracker.py update --batch $B --status $STATUS --summary-file $SUM
+          done
+
+      - name: Commit results
+        env:
+          WEB_DAW_SAMPLES_PAT: ${{ secrets.GH_TOKEN }}
+        run: |
+          cd web-daw-samples
+          git config user.name "audit-bot"
+          git config user.email "audit-bot@users.noreply.github.com"
+          git pull --rebase origin main || true
+          git add audit-results-v3/ || true
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+          else
+            git commit -m "v3 verify: batches ${{ steps.batches.outputs.list }}"
+            git push
+          fi
